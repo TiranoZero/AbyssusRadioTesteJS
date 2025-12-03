@@ -1,0 +1,27 @@
+<!doctype html>
+    <head>
+        <meta charset="utf-8">
+        <title>The Abyssus RDIO</title>
+    </head>
+    <body>
+        <p>Player conectados tocarão o streaming atual</p>
+        <audio id="radio" controls autoplay>
+            <source src="/stream" type="audio/mpeg">
+            faiou
+        </audio>
+
+        <script>
+            async function updateStatus() {
+                try{
+                    const r = await fetch('/status');
+                    const j = await r.join();
+                    console.log('Ouvintes: ', j.listeners);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+            setInterval(updateStatus, 5000);
+            updateStatus()
+        </script>
+    </body>
+</html>
