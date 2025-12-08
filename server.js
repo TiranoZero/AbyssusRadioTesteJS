@@ -5,6 +5,8 @@ const EventEmitter = require('events');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const audioDir = path.join(__dirname, 'audio');
+
 
 const playlist = fs.existsSync(audioDir)
   ? fs.readdirSync(audioDir).filter(f => f.toLowerCase().endsWith('.mp3')).map(f => path.join(audioDir, f))
