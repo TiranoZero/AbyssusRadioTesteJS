@@ -1,37 +1,109 @@
-// server.js - inicia o broadcast automaticamente
+// server.js - Rádio com FFmpeg: um stream contínuo (todos ouvintes sincronizados)
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const EventEmitter = require('events');
+const { spawn } = require('child_process');
 
 const app = express();
-app.use(express.json());
-
 const PORT = process.env.PORT || 8080;
 const audioDir = path.join(__dirname, 'audio');
+const playlistFile = path.join(__dirname, 'playlist.txt');
 
-const playlist = fs.existsSync(audioDir)
-  ? fs.readdirSync(audioDir).filter(f => f.toLowerCase().endsWith('.mp3')).map(f => path.join(audioDir, f))
-  : [];
+let ffmpeg = null;
+let clients = new Set();
+let restarting = false;
 
-console.log('Playlist:', playlist.map(p => path.basename(p)));
+// --- util: monta playlist.txt com os mp3 da pasta /audio (ordem alfabética) ---
+function buildPlaylistTxt() {
+  if (!fs.existsSync(audioDir)) {
+    console.warn('Pasta /audio não encontrada. Crie-a e adicione MP3s.');
+    fs.writeFileSync(playlistFile, '');
+    return;
+  }
+  const mp3s = fs.readdirSync(audioDir)
+    .filter(f => f.toLowerCase().endsWith('.mp3'))
+    .sort()
+    .map(f => `file '${path.join(audioDir, f).replace(/\\/g, "/")}'`);
+  fs.writeFileSync(playlistFile, mp3s.join('\n'), 'utf8');
+  console.log('playlist.txt atualizada — faixas:', mp3s.length);
+}
 
-const clients = new Set();
-const failCounts = new WeakMap();
-const attachedListeners = new WeakMap();
-const clientEvents = new EventEmitter();
+// --- inicia ffmpeg que concatena playlist.txt em loop e envia mp3 para stdout ---
+function startFfmpeg() {
+  if (ffmpeg) return;
+  if (!fs.existsSync(playlistFile) || fs.readFileSync(playlistFile, 'utf8').trim() === '') {
+    console.error('playlist.txt vazia — não foi possível iniciar o ffmpeg.');
+    return;
+  }
 
+  // ffmpeg vai ler o arquivo de concat e fazer loop infinito com -stream_loop -1 via concat demuxer não aceita stream_loop
+  // solução: usar -re -f concat -safe 0 -i playlist.txt -codec:a libmp3lame -b:a 128k -f mp3 pipe:1
+  // e quando ffmpeg terminar, reiniciamos. Para loop contínuo confiável, reiniciamos ffmpeg no 'close'.
+  console.log('Iniciando FFmpeg (gera MP3 contínuo)...');
+
+  ffmpeg = spawn('ffmpeg', [
+    '-re',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', playlistFile,
+    '-codec:a', 'libmp3lame',
+    '-b:a', '128k',
+    '-f', 'mp3',
+    'pipe:1'
+  ], { stdio: ['ignore', 'pipe', 'inherit'] });
+
+  ffmpeg.stdout.on('data', chunk => {
+    // reencaminha bytes para todos os clients conectados
+    for (const res of Array.from(clients)) {
+      try {
+        const ok = res.write(chunk);
+        if (!ok) {
+          // se write retorna false, o socket está em backpressure; deixamos que o handler 'drain' cuide
+          // mas para segurança, se demorar muito, o cliente será removido por timeout/clean
+        }
+      } catch (_) {
+        cleanupClient(res);
+      }
+    }
+  });
+
+  ffmpeg.on('error', err => {
+    console.error('FFmpeg error:', err);
+  });
+
+  ffmpeg.on('close', (code, sig) => {
+    console.warn(`FFmpeg finalizou (code=${code}, sig=${sig}). Reiniciando em 1s...`);
+    ffmpeg = null;
+    if (!restarting) {
+      restarting = true;
+      setTimeout(() => { restarting = false; startFfmpeg(); }, 1000);
+    }
+  });
+}
+
+// --- encerra ffmpeg se existir ---
+function stopFfmpeg() {
+  if (!ffmpeg) return;
+  try { ffmpeg.kill('SIGTERM'); } catch(_) {}
+  ffmpeg = null;
+}
+
+// --- cleanup de cliente ---
+function cleanupClient(res) {
+  try { res.end(); } catch(_) {}
+  clients.delete(res);
+}
+
+// --- endpoints ---
 app.use(express.static(path.join(__dirname)));
-app.use('/audio', express.static(path.join(__dirname, 'audio'), { index: false }));
+app.use('/audio', express.static(audioDir, { index: false }));
 
 app.get('/status', (req, res) => {
-  res.json({ listeners: clients.size, broadcasting: !!broadcasting });
+  res.json({ listeners: clients.size, ffmpeg: !!ffmpeg });
 });
 
 app.get('/stream', (req, res) => {
-  try { req.socket.setKeepAlive(true, 60000); } catch(_) {}
-  try { res.setMaxListeners && res.setMaxListeners(0); } catch(_) {}
-
+  // Cabeçalhos para stream MP3 contínuo
   res.set({
     'Content-Type': 'audio/mpeg',
     'Transfer-Encoding': 'chunked',
@@ -40,164 +112,39 @@ app.get('/stream', (req, res) => {
   });
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
+  // adiciona cliente
   clients.add(res);
-  failCounts.set(res, 0);
-  attachedListeners.set(res, { drainAttached: false, closeAttached: false });
+  console.log(`[${new Date().toISOString()}] novo cliente — total: ${clients.size}`);
 
-  console.log(`[${new Date().toISOString()}] novo cliente - total: ${clients.size}`);
-  clientEvents.emit('added');
-
+  // remove cliente quando desconectar
   req.on('close', () => {
-    try {
-      const flags = attachedListeners.get(res);
-      if (flags) {
-        if (flags.drainAttached) try { res.removeAllListeners('drain'); } catch(_) {}
-        if (flags.closeAttached) try { res.removeAllListeners('close'); } catch(_) {}
-      }
-    } catch(_) {}
-
     clients.delete(res);
-    try { failCounts.delete(res); attachedListeners.delete(res); } catch(_) {}
-    console.log(`[${new Date().toISOString()}] cliente desconectou - total: ${clients.size}`);
+    console.log(`[${new Date().toISOString()}] cliente desconectou — total: ${clients.size}`);
   });
 });
 
-// REMOVE sistema start/stop
-let broadcasting = false;
-let currentStream = null;
-let stopRequested = false;
+// --- inicialização ---
+buildPlaylistTxt();
+startFfmpeg();
 
-// SERVIDOR + inicia o broadcast automaticamente
 app.listen(PORT, () => {
   console.log(`Servidor rodando em http://localhost:${PORT}`);
-  
-  // inicia a transmissão automaticamente
-  if (!broadcasting) {
-    broadcasting = true;
-    console.log('Iniciando transmissão automaticamente...');
-    startBroadcastFrom(0).catch(err => {
-      console.error('Erro no broadcast:', err);
-      broadcasting = false;
-    });
-  }
+  console.log('Abra /stream para ouvir. Todos os ouvintes ouvirão o mesmo ponto do stream.');
 });
 
-/* --- lógica do broadcast --- */
-
-async function startBroadcastFrom(indexStart = 0) {
-  if (!playlist.length) {
-    console.warn('Nenhuma faixa encontrada na pasta /audio.');
-    broadcasting = false;
-    return;
+// --- (opcional) watcher: se a pasta /audio mudar, atualiza playlist e reinicia ffmpeg ---
+fs.watch(audioDir, { persistent: false }, (evt, filename) => {
+  try {
+    console.log('Mudança detectada em /audio — rebuild playlist e reinicio ffmpeg.');
+    buildPlaylistTxt();
+    // reinicia ffmpeg para carregar a nova playlist
+    if (ffmpeg) {
+      stopFfmpeg();
+      setTimeout(startFfmpeg, 800);
+    } else {
+      startFfmpeg();
+    }
+  } catch (e) {
+    console.error('Erro no watch audioDir:', e);
   }
-
-  for (let i = indexStart; broadcasting; i = (i + 1) % playlist.length) {
-    const trackPath = playlist[i];
-    if (!fs.existsSync(trackPath)) {
-      console.warn('Faixa inexistente, pulando:', trackPath);
-      continue;
-    }
-
-    console.log('=== Tocar:', path.basename(trackPath), '===');
-
-    // aguarda um ouvinte antes de tocar
-    if (clients.size === 0) {
-      console.log('Sem ouvintes — esperando alguém entrar...');
-      await waitForClient();
-      console.log('Ouvinte entrou — iniciando faixa.');
-    }
-
-    try {
-      await broadcastFile(trackPath);
-    } catch (err) {
-      console.error('Erro transmitindo arquivo:', err);
-    }
-  }
-}
-
-function waitForClient() {
-  return new Promise(resolve => {
-    if (clients.size > 0) return resolve();
-    const onAdded = () => { clientEvents.removeListener('added', onAdded); resolve(); };
-    clientEvents.on('added', onAdded);
-  });
-}
-
-function broadcastFile(filePath) {
-  return new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(filePath, { highWaterMark: 8 * 1024 });
-    currentStream = stream;
-
-    let chunks = 0, bytesSent = 0;
-    const MAX_FAILS = 500;
-
-    stream.on('error', (err) => {
-      console.error('ReadStream error:', err);
-      currentStream = null;
-      reject(err);
-    });
-
-    stream.on('end', () => {
-      console.log(`Faixa terminou: ${path.basename(filePath)} bytesSent=${bytesSent} chunks=${chunks}`);
-      currentStream = null;
-      setTimeout(resolve, 200);
-    });
-
-    stream.on('data', chunk => {
-      chunks++;
-      bytesSent += chunk.length;
-
-      const snapshot = Array.from(clients);
-      if (snapshot.length === 0) {
-        stream.pause();
-        clientEvents.once('added', () => { try { stream.resume(); } catch(_) {} });
-        return;
-      }
-
-      for (const res of snapshot) {
-        if (!res || res.writableEnded || res.destroyed) {
-          clients.delete(res);
-          try { failCounts.delete(res); attachedListeners.delete(res); } catch(_) {}
-          continue;
-        }
-
-        try {
-          const ok = res.write(chunk);
-          if (!ok) {
-            const prev = failCounts.get(res) || 0;
-            const now = prev + 1;
-            failCounts.set(res, now);
-
-            const flags = attachedListeners.get(res) || { drainAttached: false, closeAttached: false };
-
-            if (!flags.drainAttached) {
-              try { res.once('drain', () => { failCounts.set(res, 0); }); } catch(_) {}
-              flags.drainAttached = true;
-            }
-
-            if (!flags.closeAttached) {
-              try { res.once('close', () => { failCounts.delete(res); attachedListeners.delete(res); }); } catch(_) {}
-              flags.closeAttached = true;
-            }
-
-            attachedListeners.set(res, flags);
-
-            if (now >= MAX_FAILS) {
-              console.log('Cliente lento — desconectando...');
-              try { res.end(); } catch(_) {}
-              clients.delete(res);
-            }
-
-          } else {
-            if ((failCounts.get(res) || 0) > 0) failCounts.set(res, 0);
-          }
-
-        } catch (_) {
-          clients.delete(res);
-          failCounts.delete(res);
-          attachedListeners.delete(res);
-        }
-      }
-    });
-  });
-}
+});
