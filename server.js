@@ -28,7 +28,7 @@ app.get('/status', (req, res) => {
   res.json({ listeners: clients.size, broadcasting: !!broadcasting });
 });
 
-app.get('/stream', (req, res) => {
+app.get('/', (req, res) => {
   // registro do cliente
   try { req.socket.setKeepAlive(true, 60000); } catch(_) {}
   try { res.setMaxListeners && res.setMaxListeners(0); } catch(_) {}
