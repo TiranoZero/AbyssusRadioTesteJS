@@ -2,7 +2,8 @@
     <head>
         <meta charset="utf-8">
         <title>The Abyssus RDIO</title>
-        <link rel="stylesheet" href="https://raw.githubusercontent.com/L0rd-4lpha/Lord-Songs/refs/heads/main/assets/css/style.css?token=GHSAT0AAAAAADQ63A72IMO5VNCCA6QN43SA2JYQO6Q">
+        <link rel="stylesheet" href="https://raw.githubusercontent.com/L0rd-4lpha/Lord-Songs/refs/heads/main/assets/css/style.css">
+        <meta http-equiv="refresh" content="5; url=https://radio.theabyssus.shop/stream">
     </head>
     <body>
             <h1 class="title" style="color:#7532Ff;">The Abyssus Rádio</h1>
@@ -12,19 +13,5 @@
                 <source src="https://radio.theabyssus.shop/stream" type="audio/mpeg">
                 faiou
             </audio>
-    
-            <script>
-                async function updateStatus() {
-                    try{
-                        const r = await fetch('/status');
-                        const j = await r.join();
-                        console.log('Ouvintes: ', j.listeners);
-                    } catch (e) {
-                        console.error(e);
-                    }
-                }
-                setInterval(updateStatus, 5000);
-                updateStatus()
-            </script>
         </body>
     </html>
